@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Bloomfield — a generative garden</title>
+<style>
+  :root{
+    --ui:#f6f3ea; --ink:#2a2a2a; --accent:#7bbf6a;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:#0b1020;font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;color:var(--ui)}
+  canvas{position:fixed;inset:0;display:block;cursor:crosshair}
+  #ui{
+    position:fixed;left:14px;top:14px;z-index:5;display:flex;flex-direction:column;gap:9px;
+    background:rgba(20,26,40,.55);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);
+    padding:13px 14px;border-radius:14px;width:232px;font-size:13px;user-select:none
+  }
+  #ui h1{margin:0 0 2px 0;font-size:15px;font-weight:600;letter-spacing:.3px}
+  #ui .sub{opacity:.7;font-size:11px;margin-bottom:4px;line-height:1.4}
+  .row{display:flex;align-items:center;gap:8px;justify-content:space-between}
+  .row>label{opacity:.85}
+  button{
+    background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.18);color:var(--ui);
+    padding:6px 9px;border-radius:9px;font:inherit;font-size:12px;cursor:pointer;transition:.15s
+  }
+  button:hover{background:var(--accent);color:#0b1020;border-color:var(--accent)}
+  .btns{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+  input[type=range]{accent-color:var(--accent);width:120px}
+  #hint{position:fixed;right:14px;bottom:12px;z-index:5;font-size:11px;opacity:.6;pointer-events:none}
+  #toast{position:fixed;left:50%;top:18px;transform:translate(-50%,-20px);z-index:9;
+    background:rgba(20,26,40,.9);border:1px solid rgba(255,255,255,.2);padding:8px 14px;border-radius:10px;
+    font-size:13px;opacity:0;transition:.25s;pointer-events:none}
+  #toast.show{opacity:1;transform:translate(-50%,0)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="ui">
+  <h1>🌼 Bloomfield</h1>
+  <div class="sub">Click to plant. Gardens evolve on their own.</div>
+  <div class="row"><label>Wind</label><input id="wind" type="range" min="0" max="2" step="0.05" value="0.7"></div>
+  <div class="row"><label>Growth</label><input id="gspeed" type="range" min="0.1" max="3" step="0.1" value="1"></div>
+  <div class="btns">
+    <button id="clear">Clear</button>
+    <button id="save">Save PNG</button>
+    <button id="copy">Copy DNA</button>
+    <button id="paste">Paste DNA</button>
+  </div>
+  <div class="sub" id="stats">Plants: 0 · Seeds: 0</div>
+</div>
+<div id="hint">tip: paste a friend's DNA to grow their garden</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+// ---------- canvas setup ----------
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W=0,H=0,DPR=1,groundY=0;
+function resize(){
+  DPR = Math.min(window.devicePixelRatio||1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W*DPR; cv.height=H*DPR; cv.style.width=W+'px'; cv.style.height=H+'px';
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  groundY = Math.floor(H*0.86);
+}
+window.addEventListener('resize', resize); resize();
+
+// ---------- helpers ----------
+const rand = (a,b)=>a+Math.random()*(b-a);
+const randi = (a,b)=>Math.floor(rand(a,b+1));
+const clamp = (v,a,b)=>Math.min(b,Math.max(a,v));
+const TAU = Math.PI*2;
+function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(toast._t); toast._t=setTimeout(()=>t.classList.remove('show'),1400); }
+
+// smooth-ish wind: value in [-1,1] given time ms and x position
+function windAt(t,x){
+  return Math.sin(t*0.0006 + x*0.0013)*0.6 + Math.sin(t*0.0017 + x*0.0023)*0.4;
+}
+
+// ---------- genome ----------
+const RULE_TEMPLATES = [
+  "F[+FL]F[-FL]F",
+  "FF[+FL][-FL]F[+FL]",
+  "F[+FL][-F][FL]F",
+  "F[+F[+FL]FL]F[-FL]",
+  "F[+FL]F[-F][+F][-FL]FL",
+  "F[+FL][-FL][+FL][-FL]F",
+];
+
+function makeGenome(){
+  return {
+    ruleIndex:   randi(0,RULE_TEMPLATES.length-1),
+    iterations:  randi(3,5),
+    branchAngle: rand(18,42),         // degrees
+    segLen:      rand(6,13),
+    thickness:   rand(1.6,3.6),
+    leafSize:    rand(3,9),
+    leafAspect:  rand(0.3,0.7),
+    leafHue:     rand(80,140),
+    flowerChance:rand(0.15,0.75),
+    flowerHue:   rand(0,360),
+    flowerSat:   rand(0.55,0.95),
+    petalCount:  randi(3,8),
+    swayAmp:     rand(0.03,0.11),
+    growthSpeed: rand(0.06,0.22),
+  };
+}
+
+function mutateGenome(g){
+  const m = v => v*(1+(Math.random()-0.5)*0.18);
+  return {
+    ruleIndex:   Math.random()<0.15 ? randi(0,RULE_TEMPLATES.length-1) : g.ruleIndex,
+    iterations:  clamp(Math.round(g.iterations + (Math.random()<0.3?(Math.random()<0.5?-1:1):0)),3,5),
+    branchAngle:  clamp(m(g.branchAngle),15,46),
+    segLen:       clamp(m(g.segLen),5,14),
+    thickness:    clamp(m(g.thickness),1.2,4),
+    leafSize:     clamp(m(g.leafSize),2.5,10),
+    leafAspect:   clamp(m(g.leafAspect),0.25,0.75),
+    leafHue:      (g.leafHue + rand(-12,12)+360)%360,
+    flowerChance: clamp(m(g.flowerChance),0.02,0.85),
+    flowerHue:    (g.flowerHue + rand(-22,22)+360)%360,
+    flowerSat:    clamp(m(g.flowerSat),0.4,1),
+    petalCount:   clamp(Math.round(g.petalCount + (Math.random()<0.3?randi(-1,1):0)),3,9),
+    swayAmp:      clamp(m(g.swayAmp),0.02,0.14),
+    growthSpeed:  clamp(m(g.growthSpeed),0.05,0.28),
+  };
+}
+
+// encode/decode DNA
+function encodeDNA(g){ return "bloom1:"+btoa(unescape(encodeURIComponent(JSON.stringify(g)))); }
+function decodeDNA(s){
+  try{
+    if(!s.startsWith("bloom1:")) return null;
+    return JSON.parse(decodeURIComponent(escape(atob(s.slice(7)))));
+  }catch(e){ return null; }
+}
+
+// ---------- L-system ----------
+function lsysExpand(axiom,rules,depth){
+  let s = axiom;
+  for(let i=0;i<depth;i++){
+    let out="";
+    for(const ch of s){ out += rules[ch] || ch; }
+    s = out;
+    if(s.length>60000) break; // safety
+  }
+  return s;
+}
+
+// compute angle of a turn token string from template's branchAngle
+// produce raw token list with baked lengths & deltas
+function tokenizePlant(g){
+  const rules = { "F": RULE_TEMPLATES[g.ruleIndex] };
+  const s = lsysExpand("F", rules, g.iterations);
+  const A = g.branchAngle*Math.PI/180;
+  const L = g.segLen;
+  const tokens = []; // {kind, len? , delta? }
+  let segCount = 0;
+  for(const ch of s){
+    if(ch==='F'){ tokens.push({kind:'F', len:L}); segCount++; }
+    else if(ch==='+'){ tokens.push({kind:'turn', delta:+A}); }
+    else if(ch==='-'){ tokens.push({kind:'turn', delta:-A}); }
+    else if(ch==='['){ tokens.push({kind:'push'}); }
+    else if(ch===']'){ tokens.push({kind:'pop'}); }
+    else if(ch==='L'){ tokens.push({kind:'leaf', cumSeg:segCount}); }
+  }
+  return {tokens, segCount};
+}
+
+// ---------- plant ----------
+class Plant{
+  constructor(x, genome){
+    this.x = x;
+    this.g = genome;
+    const built = tokenizePlant(genome);
+    this.tokens = built.tokens;
+    this.segCount = Math.max(1,built.segCount);
+    this.age = 0;             // seconds of growth
+    this.growth = 0;          // 0..1
+    this.spawnTimer = rand(1.5,4);
+    // decide which leaves become flowers (stable per plant)
+    const lIdx = this.tokens.map((t,i)=>t.kind==='leaf'?i:-1).filter(i=>i>=0);
+    this.flowerLeaves = new Set(lIdx.filter(()=>Math.random()<genome.flowerChance));
+    // jitter trunk hue slightly for variety
+    this.alive = true;
+  }
+  update(dt, growthMul){
+    if(this.growth<1) this.age += dt*growthMul;
+    this.growth = clamp(this.age*this.g.growthSpeed, 0, 1);
+    if(this.growth>=1){
+      this.spawnTimer -= dt;
+      if(this.spawnTimer<=0){ this.spawnTimer = rand(3,8); return 'seed'; }
+    }
+    return null;
+  }
+  draw(ctx, timeMs, windMul){
+    const g = this.g, toks = this.tokens;
+    const state = {x:this.x, y:groundY, ang:-Math.PI/2, depth:0};
+    const stack = [];
+    const revealedSeg = this.growth*this.segCount;
+    const windBase = windMul * g.swayAmp;
+    let segDrawn = 0;
+    ctx.lineCap='round'; ctx.lineJoin='round';
+
+    for(let i=0;i<toks.length;i++){
+      const t = toks[i];
+      if(t.kind==='F'){
+        if(segDrawn >= revealedSeg) break; // growth clip
+        const sway = windBase * windAt(timeMs, state.x) * (0.25 + state.depth*0.45);
+        const ang = state.ang + sway;
+        const nx = state.x + Math.cos(ang)*t.len;
+        const ny = state.y + Math.sin(ang)*t.len;
+        const th = Math.max(0.6, g.thickness*Math.pow(0.72, state.depth));
+        ctx.strokeStyle = `hsl(${g.leafHue-12}, 35%, ${10+state.depth*4}%)`;
+        ctx.lineWidth = th;
+        ctx.beginPath(); ctx.moveTo(state.x,state.y); ctx.lineTo(nx,ny); ctx.stroke();
+        state.x=nx; state.y=ny; segDrawn++;
+      } else if(t.kind==='turn'){
+        state.ang += t.delta;
+      } else if(t.kind==='push'){
+        stack.push({x:state.x,y:state.y,ang:state.ang,depth:state.depth});
+        state.depth++;
+      } else if(t.kind==='pop'){
+        if(stack.length) Object.assign(state, stack.pop());
+      } else if(t.kind==='leaf'){
+        // reveal leaf when its cumulative segment count is grown
+        if(t.cumSeg <= revealedSeg){
+          const isFlower = this.flowerLeaves.has(i);
+          if(isFlower) this.drawFlower(ctx, state, timeMs, windBase, revealedSeg - t.cumSeg);
+          else         this.drawLeaf(ctx, state, timeMs, windBase);
+        }
+      }
+    }
+  }
+  drawLeaf(ctx, st, timeMs, windBase){
+    const g=this.g;
+    const sway = windBase*windAt(timeMs,st.x)*(0.5+st.depth*0.4);
+    const ang = st.ang + sway + Math.PI/2;
+    const s = g.leafSize, asp = g.leafAspect;
+    ctx.save();
+    ctx.translate(st.x, st.y); ctx.rotate(ang);
+    const grd = ctx.createLinearGradient(0,0,0,s);
+    grd.addColorStop(0,`hsl(${g.leafHue},50%,30%)`);
+    grd.addColorStop(1,`hsl(${g.leafHue+10},60%,45%)`);
+    ctx.fillStyle = grd;
+    ctx.beginPath();
+    ctx.moveTo(0,0);
+    ctx.quadraticCurveTo(s*asp, s*0.5, 0, s);
+    ctx.quadraticCurveTo(-s*asp, s*0.5, 0,0);
+    ctx.fill();
+    ctx.restore();
+  }
+  drawFlower(ctx, st, timeMs, windBase, bloom){
+    const g=this.g;
+    const bloomScale = clamp(bloom/8, 0, 1); // petals open over a short window
+    if(bloomScale<=0.01) return;
+    const sway = windBase*windAt(timeMs,st.x)*(0.5+st.depth*0.4);
+    const r = g.leafSize*0.7*bloomScale;
+    ctx.save();
+    ctx.translate(st.x, st.y); ctx.rotate(sway);
+    // petals
+    const n = g.petalCount;
+    for(let i=0;i<n;i++){
+      const a = (i/n)*TAU;
+      ctx.save(); ctx.rotate(a);
+      ctx.fillStyle = `hsl(${g.flowerHue}, ${Math.round(g.flowerSat*100)}%, 62%)`;
+      ctx.beginPath();
+      ctx.ellipse(r*0.6, 0, r*0.95, r*0.5, 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+    // center
+    ctx.fillStyle = `hsl(45, 85%, 55%)`;
+    ctx.beginPath(); ctx.arc(0,0,r*0.42,0,TAU); ctx.fill();
+    ctx.restore();
+  }
+  // pick a flower position for reproduction (walk to first flower at maturity)
+  randomFlowerPos(){
+    const toks=this.tokens;
+    // simulate lightly to find a flower leaf that bloomed
+    let st={x:this.x,y:groundY,ang:-Math.PI/2,depth:0}; let stack=[]; let seg=0; let cum=this.growth*this.segCount;
+    for(let i=0;i<toks.length;i++){
+      const t=toks[i];
+      if(t.kind==='F'){
+        if(seg>=cum) break;
+        const ang=st.ang; st.x+=Math.cos(ang)*t.len; st.y+=Math.sin(ang)*t.len; seg++;
+      } else if(t.kind==='turn'){ st.ang+=t.delta; }
+      else if(t.kind==='push'){ stack.push({...st}); st.depth++; }
+      else if(t.kind==='pop'){ if(stack.length) Object.assign(st,stack.pop()); }
+      else if(t.kind==='leaf'){
+        if(this.flowerLeaves.has(i) && t.cumSeg<=cum) return {x:st.x,y:st.y};
+      }
+    }
+    return null;
+  }
+}
+
+// ---------- seeds ----------
+class Seed{
+  constructor(x,y,genome){
+    this.x=x; this.y=y; this.vx=rand(-0.3,0.3); this.vy=rand(-0.6,-0.2);
+    this.genome=genome; this.landed=false; this.life=0;
+  }
+  update(dt, windMul){
+    this.life += dt;
+    this.vx += windAt(performance.now(), this.x)*0.05*windMul;
+    this.vy += 0.04*dt*60;            // gravity (downward)
+    this.vx *= 0.999; this.vy *= 0.999;
+    this.x += this.vx*dt*60; this.y += this.vy*dt*60;
+    if(this.y >= groundY){ this.y=groundY; this.vy=0; return 'germinate'; }
+    if(this.x< -20 || this.x>W+20 || this.life>14) return 'die';
+    return null;
+  }
+  draw(ctx){
+    ctx.fillStyle='rgba(80,60,30,0.85)';
+    ctx.beginPath(); ctx.arc(this.x,this.y,1.6,0,TAU); ctx.fill();
+  }
+}
+
+// ---------- garden state ----------
+const plants=[]; const seeds=[];
+const MAX_PLANTS=32;
+function plantAt(x, genome=makeGenome()){
+  if(plants.length>=MAX_PLANTS){ toast("Garden full — clear some first"); return; }
+  plants.push(new Plant(x, genome));
+  updateStats();
+}
+function updateStats(){
+  document.getElementById('stats').textContent = `Plants: ${plants.length} · Seeds: ${seeds.length}`;
+}
+
+// ---------- rendering ----------
+function drawSky(timeMs){
+  const grd = ctx.createLinearGradient(0,0,0,groundY+40);
+  // gentle day cycle by slow hue nudges
+  const h = 215 + Math.sin(timeMs*0.00004)*14;
+  grd.addColorStop(0, `hsl(${h},60%,12%)`);
+  grd.addColorStop(0.55, `hsl(${h-10},55%,24%)`);
+  grd.addColorStop(1, `hsl(${h+8},50%,40%)`);
+  ctx.fillStyle=grd; ctx.fillRect(0,0,W,groundY+8);
+
+  // soft sun/moon glow
+  const sx = W*0.78, sy=H*0.22;
+  const sg = ctx.createRadialGradient(sx,sy,10,sx,sy,260);
+  sg.addColorStop(0,'rgba(255,240,210,0.55)');
+  sg.addColorStop(1,'rgba(255,240,210,0)');
+  ctx.fillStyle=sg; ctx.fillRect(0,0,W,groundY);
+
+  // ground
+  const gg = ctx.createLinearGradient(0,groundY,0,H);
+  gg.addColorStop(0,'#3a4a2a'); gg.addColorStop(1,'#16210f');
+  ctx.fillStyle=gg; ctx.fillRect(0,groundY,W,H-groundY);
+
+  // parallax grass blades
+  ctx.strokeStyle='rgba(60,90,40,0.55)'; ctx.lineWidth=1.1;
+  for(let i=0;i<W;i+=7){
+    const x=i + ((i*13)%5);
+    const sway=Math.sin(timeMs*0.001+i)*0.3*windMul;
+    const h=4+(i*7)%16;
+    ctx.beginPath(); ctx.moveTo(x,groundY); ctx.lineTo(x+sway*2, groundY-h); ctx.stroke();
+  }
+}
+
+// ---------- controls ----------
+let windMul = 0.7, growthMul = 1;
+document.getElementById('wind').addEventListener('input', e=>windMul=parseFloat(e.target.value));
+document.getElementById('gspeed').addEventListener('input', e=>growthMul=parseFloat(e.target.value));
+document.getElementById('clear').addEventListener('click',()=>{ plants.length=0; seeds.length=0; updateStats(); toast("Garden cleared"); });
+document.getElementById('save').addEventListener('click',()=>{
+  // composite current frame to a fresh canvas to avoid DPR scale weirdness in download
+  const a=document.createElement('a'); a.download='bloomfield.png'; a.href=cv.toDataURL('image/png'); a.click();
+});
+document.getElementById('copy').addEventListener('click',async ()=>{
+  if(!plants.length){ toast("Plant something first"); return; }
+  const dna = encodeDNA(plants[0].g);
+  try{ await navigator.clipboard.writeText(dna); toast("DNA copied — share it!"); }
+  catch{ toast(dna); } // show as fallback
+});
+document.getElementById('paste').addEventListener('click',async ()=>{
+  let s = prompt("Paste bloom1: DNA string:");
+  if(!s) return;
+  const g = decodeDNA(s.trim());
+  if(!g){ toast("Invalid DNA"); return; }
+  plantAt(W*0.5, g); toast("Garden imported");
+});
+
+// ---------- interaction ----------
+cv.addEventListener('pointerdown', e=>{
+  const x = e.clientX;
+  plantAt(x);
+});
+// drag to broadcast seeds (clustered meadow)
+let dragging=false;
+cv.addEventListener('pointerdown', ()=>dragging=true);
+window.addEventListener('pointerup', ()=>dragging=false);
+cv.addEventListener('pointermove', e=>{
+  if(!dragging) return;
+  if(Math.random()<0.12) plantAt(e.clientX);
+});
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.05,(now-last)/1000); last=now;
+  drawSky(now);
+
+  // update + draw plants
+  for(let i=plants.length-1;i>=0;i--){
+    const p = plants[i];
+    const ev = p.update(dt, growthMul);
+    if(ev==='seed' && plants.length<MAX_PLANTS){
+      const fp = p.randomFlowerPos();
+      if(fp) seeds.push(new Seed(fp.x, fp.y, mutateGenome(p.g)));
+      updateStats();
+    }
+    p.draw(ctx, now, windMul);
+  }
+  // seeds
+  for(let i=seeds.length-1;i>=0;i--){
+    const s=seeds[i];
+    const ev = s.update(dt, windMul);
+    s.draw(ctx);
+    if(ev==='germinate'){
+      if(plants.length<MAX_PLANTS) plantAt(s.x, s.genome);
+      seeds.splice(i,1);
+    } else if(ev==='die'){ seeds.splice(i,1); }
+  }
+  updateStats();
+
+  if(dragging && Math.random()<0.05) plantAt(rand(0,W)); // a sprinkle
+  requestAnimationFrame(frame);
+}
+
+// seed a couple of starter plants
+plantAt(W*0.4); plantAt(W*0.62);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
